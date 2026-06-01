@@ -58,8 +58,6 @@ PREVIOUS_SONG=*
 
 ### Note
 
-
-
 To search for specific song, quickly **press** `/` and type a couple charaters of the requested music file. Note that **NOT** to type the charaters that control (keybindings) the music player.
 
 When you search for a song name and find it, make sure to erase the input with your backspace (above than Enter key), after that press the **search** key once again to bring you to the menu with the song files.

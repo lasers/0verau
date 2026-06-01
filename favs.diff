@@ -1,0 +1,177 @@
+diff --git a/main.cpp b/main.cpp
+index 55e4d17..38192ce 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -94,11 +94,18 @@ static void handle_event(const libvlc_event_t* event, void* user_data);
+ void signal_handler(int);
+ // Load key bindings from config file
+ std::unordered_map<std::string, int> loadKeyBindings(const std::string &configPath);
++// Load,Save,Remove favourite song(s)
++std::vector<std::string> loadFav(void);
++void addFav(int toRemove);
+ 
+ sf::Music music;
+ int currentLine = 0;
+ int currentTrack = -1;
++int highlight = 0;
++int showFavourites = 0;
++std::vector<Track> playlist;
+ std::vector<Track> playlist2;
++std::vector<Track> playlist3;
+ std::vector<Track> mp3Playlist;
+ std::vector<Track> m3uPlaylist;
+ std::string vlcSongMeta = "";
+@@ -108,6 +115,7 @@ std::atomic<bool> running(true);
+ libvlc_media_t *media = nullptr;
+ std::string trackName = "No track selected";
+ std::string mp3Name = "";
++std::string mp3Home = (getenv("HOME") ? static_cast<std::string>(getenv("HOME")) : static_cast<std::string>(".")) + static_cast<std::string>("/0verau.list");
+ 
+ using json = nlohmann::json;
+ 
+@@ -115,7 +123,7 @@ int main(int argc, char *argv[]) {
+   if (argc < 2) { std::cerr << "You must provide some folder with music in it and if you have radio.m3u folder (as second argument) for listening to online radio stations." << std::endl; return EXIT_FAILURE; }
+   std::signal(SIGINT, signal_handler);
+   std::string musicDir = argv[1]; // Change to your music folder
+-  auto playlist = listAudioFiles(musicDir);
++  playlist = listAudioFiles(musicDir);
+   if (playlist.empty()) { std::cerr << "No audio files found in " << musicDir << "\n"; return EXIT_FAILURE; }
+ 
+   mp3Playlist = playlist;
+@@ -135,7 +143,6 @@ int main(int argc, char *argv[]) {
+   curs_set(0);
+   timeout(200); // Non-blocking getch
+ 
+-  int highlight = 0;
+   int offset = 0;
+   int choice;
+   bool shuffle = false;
+@@ -180,6 +187,9 @@ int main(int argc, char *argv[]) {
+     if (showHideLyrics == 0 && showOnlineRadio == 0) {
+       drawStatus(rows, cols, playlist, highlight, colorPair, status, offset, shuffle, repeat, volume, searchQuery, keys, showHideAlbum, showHideArtist, mp3Playlist);
+     }
++    else if (showFavourites == 1) {
++      drawStatus(rows, cols, playlist3, highlight, colorPair, status, offset, shuffle, repeat, volume, searchQuery, keys, showHideAlbum, showHideArtist, playlist3);
++    }
+     else if (showOnlineRadio == 1) {
+       drawStatus(rows, cols, playlist2, highlight, colorPair, status, offset, shuffle, repeat, volume, searchQuery, keys, showHideAlbum, showHideArtist, m3uPlaylist);
+       std::this_thread::sleep_for(std::chrono::milliseconds(30));
+@@ -202,6 +212,11 @@ int main(int argc, char *argv[]) {
+       if (showOnlineRadio == 0) {
+         highlight = (highlight - 1 + playlist.size()) % playlist.size();
+       }
++      else if (showFavourites == 1) {
++        if (!playlist3.empty()) {
++          highlight = (highlight - 1 + playlist3.size()) % playlist3.size();
++        }
++      }
+       else {
+         if (!playlist2.empty()) {
+           highlight = (highlight - 1 + playlist2.size()) % playlist2.size();
+@@ -212,6 +227,11 @@ int main(int argc, char *argv[]) {
+       if (showOnlineRadio == 0) {
+         highlight = (highlight + 1) % playlist.size();
+       }
++      else if (showFavourites == 1) {
++        if (!playlist3.empty()) {
++          highlight = (highlight + 1) % playlist3.size();
++        }
++      }
+       else {
+         if (!playlist2.empty()) {
+           highlight = (highlight + 1) % playlist2.size();
+@@ -241,6 +261,17 @@ int main(int argc, char *argv[]) {
+         playingMp3 = true;
+         mp3Name = playlist[currentTrack].title;
+       }
++      else if (showFavourites == 1) {
++        addFav(0);
++        /*if (!playlist3.empty()) {
++          if (choice == keys["PREVIOUS_SONG"]) {
++            highlight = (highlight - 1 + playlist3.size()) % playlist3.size();
++          }
++          else if (choice == keys["NEXT_SONG"]) {
++            highlight = (highlight + 1 + playlist3.size()) % playlist3.size();
++          }
++        }*/
++      }
+       else {
+         if (!playlist2.empty()) {
+           if (choice == keys["PREVIOUS_SONG"]) {
+@@ -289,6 +320,13 @@ int main(int argc, char *argv[]) {
+         }
+       }
+     }
++    else if (choice == keys["REMOVE_FROM_FAVS"]) {
++      if (!playlist3.empty()) {
++        playlist3[highlight].path = "";
++        playlist3[highlight].title = "";
++        addFav(1);
++      }
++    }
+     else if (choice == keys["SHUFFLE"]) {
+       shuffle = !shuffle;
+     }
+@@ -313,6 +351,13 @@ int main(int argc, char *argv[]) {
+         highlight = (highlight + playlist2.size()) % playlist2.size();
+       }
+     }
++    else if (choice == keys["SHOW_HIDE_FAVOURITES"]) {
++      showFavourites = !showFavourites;
++    }
++    else if (choice == keys["ADD_FAVOURITE"]) {
++      if (showFavourites == 0) addFav(0);
++      else addFav(1);
++    }
+     else if (choice == keys["SEARCH"]) {
+       echo();
+       curs_set(1);
+@@ -399,6 +444,40 @@ int main(int argc, char *argv[]) {
+   return EXIT_SUCCESS;
+ }
+ 
++std::vector<std::string> loadFav(void) {
++  std::vector<std::string> fav;
++  std::vector<std::string> favEmpty = {""};
++  std::string line;
++  std::ifstream favs(mp3Home);
++  if (!favs.is_open()) return !fav.empty() ? fav : favEmpty;
++  playlist3.clear();
++  while (std::getline(favs, line)) {
++    if (line.empty()) continue;
++    fav.push_back(line);
++    playlist3.push_back(readMetadata(line));
++  }
++  favs.close();
++  //playlist3.push_back(playlist[highlight]);
++  return !fav.empty() ? fav : favEmpty;
++}
++
++void addFav(int toRemove) {
++  std::vector<std::string> favs = loadFav();
++  if (toRemove == 1) {
++    unsigned int x = 0U;
++    for (; x < favs.size(); x++) {
++      if (favs[x] == playlist3[highlight].path) { favs[x] = ""; break; }
++    }
++  }
++  std::ofstream fileToSave(mp3Home, std::ios::trunc);
++  unsigned int songMatch = 0U;
++  if (!fileToSave) return;
++  if (!favs.empty()) { for (const auto &savedFav : favs) { fileToSave << savedFav << "\n"; } }
++  for (const auto &line : favs) { if (line == playlist[highlight].path) { songMatch = 1U; break; } }
++  if (songMatch == 0U && toRemove == 0) fileToSave << playlist[highlight].path << "\n";
++  else showFavourites = 0U;
++}
++
+ // Event callback for metadata changes
+ static void handle_event(const libvlc_event_t *event, void *user_data) {
+   if (event->type == libvlc_MediaMetaChanged) {
+@@ -832,6 +911,7 @@ std::unordered_map<std::string, int> loadKeyBindings(const std::string &configPa
+     {"UP", 'i'}, {"DOWN", 'j'}, {"PLAY", 'o'}, {"SEEKLEFT", ','}, {"SEEKRIGHT", '.'}, {"NEXT_SONG", '&'}, {"PREVIOUS_SONG", '*'},
+     {"PAUSE", 'p'}, {"QUIT", 'q'}, {"REPEAT", '@'}, {"SHOW_HIDE_ALBUM", '$'}, {"SHOW_HIDE_ONLINE_RADIO", '^'},
+     {"SHUFFLE", '!'}, {"SEARCH", '/'}, {"VOLUMEUP", '+'}, {"VOLUMEDOWN", '-'}, {"SHOW_HIDE_ARTIST", '#'}, {"SHOW_HIDE_LYRICS", '%'},
++    {"SHOW_HIDE_FAVOURITES", '('}, {"ADD_FAVOURITE", ')'}, {"REMOVE_FROM_FAVS", '['},
+   };
+   std::ifstream file(configPath);
+   if (!file.is_open()) { return keys; }
