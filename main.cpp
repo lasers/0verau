@@ -544,7 +544,7 @@ void drawStatus(int rows, int cols, std::vector<Track> playlist, int highlight, 
   for (int i = 0; i < visibleRows && i + offset < static_cast<int>(playlist.size()); ++i) {
     int idx = i + offset;
     if (idx == highlight) attron(A_REVERSE);
-    if (highlight < offset) { offset = highlight };
+    if (highlight < offset) { offset = highlight; };
     if (highlight >= offset + visibleRows) { offset = highlight - visibleRows + 1; }
     //mvprintw(i + 2, 0, "%s", playlist[idx].name.c_str());
     mvprintw(i + 2, 0, "%s %s %s %s", ((showHideAlbum == 1) ? playlist[idx].album.c_str() : ""), ((showHideArtist == 1) ? playlist[idx].artist.c_str() : ""), playlist[idx].title.c_str(), playlist[idx].duration.c_str());
