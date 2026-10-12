@@ -32,6 +32,7 @@
 #include <chrono>
 #include <iomanip>
 #include <regex>
+#include <mutex>
 #include <atomic>
 #include <csignal>
 #include <SFML/Audio.hpp>
@@ -64,6 +65,7 @@ void drawStatus(int rows, int cols, std::vector<Track> playlist, int highlight, 
 // Filter playlist by search term
 std::vector<Track> filterTracks(const std::vector<Track> &tracks, const std::string &term);
 // List audio files in directory
+void listAudioFilesInThread(const std::string &path);
 std::vector<Track> listAudioFiles(const std::string &path);
 // List m3u online radio files in directory
 std::vector<Track> listM3uFiles(const std::string &path);
@@ -98,12 +100,15 @@ std::unordered_map<std::string, int> loadKeyBindings(const std::string &configPa
 sf::Music music;
 int currentLine = 0;
 int currentTrack = -1;
+std::vector<Track> playlist;
 std::vector<Track> playlist2;
 std::vector<Track> mp3Playlist;
 std::vector<Track> m3uPlaylist;
 std::string vlcSongMeta = "";
 bool vlcPlaying = false;
 bool playingMp3 = false;
+std::mutex mp3Mutex;
+std::atomic<bool> scanDone(false);
 std::atomic<bool> running(true);
 libvlc_media_t *media = nullptr;
 std::string trackName = "No track selected";
@@ -115,8 +120,9 @@ int main(int argc, char *argv[]) {
   if (argc < 2) { std::cerr << "You must provide some folder with music in it and if you have radio.m3u folder (as second argument) for listening to online radio stations." << std::endl; return EXIT_FAILURE; }
   std::signal(SIGINT, signal_handler);
   std::string musicDir = argv[1]; // Change to your music folder
-  auto playlist = listAudioFiles(musicDir);
-  if (playlist.empty()) { std::cerr << "No audio files found in " << musicDir << "\n"; return EXIT_FAILURE; }
+  //playlist = listAudioFiles(musicDir);
+  std::thread th(listAudioFilesInThread, musicDir);
+  //if (playlist.empty()) { std::cerr << "No audio files found in " << musicDir << "\n"; return EXIT_FAILURE; }
 
   mp3Playlist = playlist;
   // Load key bindings from config file
@@ -394,6 +400,7 @@ int main(int argc, char *argv[]) {
     libvlc_media_player_release(player);
   }
   libvlc_release(vlc);
+  th.join();
   // Cleanup ncurses
   endwin();
   return EXIT_SUCCESS;
@@ -540,19 +547,24 @@ void drawStatus(int rows, int cols, std::vector<Track> playlist, int highlight, 
   int visibleRows = rows - 6;
   //if (highlight < offset) offset = highlight;
   //if (highlight >= offset + visibleRows) offset = highlight - visibleRows + 1;
-
-  for (int i = 0; i < visibleRows && i + offset < static_cast<int>(playlist.size()); ++i) {
-    int idx = i + offset;
-    if (idx == highlight) attron(A_REVERSE);
-    if (highlight < offset) { offset = highlight; };
-    if (highlight >= offset + visibleRows) { offset = highlight - visibleRows + 1; }
-    //mvprintw(i + 2, 0, "%s", playlist[idx].name.c_str());
-    mvprintw(i + 2, 0, "%s %s %s %s", ((showHideAlbum == 1) ? playlist[idx].album.c_str() : ""), ((showHideArtist == 1) ? playlist[idx].artist.c_str() : ""), playlist[idx].title.c_str(), playlist[idx].duration.c_str());
-    if (idx == highlight) attroff(A_REVERSE);
+  if (scanDone) {
+    for (int i = 0; i < visibleRows && i + offset < static_cast<int>(playlist.size()); ++i) {
+      int idx = i + offset;
+      if (idx == highlight) attron(A_REVERSE);
+      if (highlight < offset) { offset = highlight; };
+      if (highlight >= offset + visibleRows) { offset = highlight - visibleRows + 1; }
+      //mvprintw(i + 2, 0, "%s", playlist[idx].name.c_str());
+      mvprintw(i + 2, 0, "%s %s %s %s", ((showHideAlbum == 1) ? playlist[idx].album.c_str() : ""), ((showHideArtist == 1) ? playlist[idx].artist.c_str() : ""), playlist[idx].title.c_str(), playlist[idx].duration.c_str());
+      if (idx == highlight) attroff(A_REVERSE);
+    }
   }
 
-  // Show status
-  mvprintw(rows - 4, 0, "Tracks: %u | Shuffle: %s | Repeat: %s | Show Album %s | Show Artist %s | Volume: %u%%", static_cast<unsigned int>(playlist.size()), shuffle ? "ON" : "OFF", repeat ? "ON" : "OFF", showHideAlbum ? "ON" : "OFF", showHideArtist ? "ON" : "OFF" , static_cast<unsigned int>(volume));
+  if (scanDone) {
+    // Show status
+    mvprintw(rows - 4, 0, "Tracks: %u | Shuffle: %s | Repeat: %s | Show Album %s | Show Artist %s | Volume: %u%%", static_cast<unsigned int>(playlist.size()), shuffle ? "ON" : "OFF", repeat ? "ON" : "OFF", showHideAlbum ? "ON" : "OFF", showHideArtist ? "ON" : "OFF" , static_cast<unsigned int>(volume));
+  } else {
+    mvprintw(rows - 4, 0, "Scanning for songs, please wait....");
+  }
 
   // Show search query
   if (!searchQuery.empty()) {
@@ -579,6 +591,27 @@ std::vector<Track> filterTracks(const std::vector<Track> &tracks, const std::str
   return filtered;
 }
 
+// List audio files in directory in other thread
+void listAudioFilesInThread(const std::string &path) {
+  //std::vector<Track> files;
+  try {
+    for (const auto &entry : std::filesystem::directory_iterator(path)) {
+      if (entry.is_regular_file()) {
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".wav" || ext == ".ogg" || ext == ".flac" || ext == ".mp3") {
+          std::lock_guard<std::mutex> lock(mp3Mutex);
+          playlist.push_back(readMetadata(entry.path()));
+          //files.push_back({entry.path().string(), entry.path().filename().string()});
+        }
+      }
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "Error reading directory: " << e.what() << "\n";
+  }
+  scanDone = true;
+}
+
 // List audio files in directory
 std::vector<Track> listAudioFiles(const std::string &path) {
   std::vector<Track> files;
@@ -588,6 +621,7 @@ std::vector<Track> listAudioFiles(const std::string &path) {
         std::string ext = entry.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         if (ext == ".wav" || ext == ".ogg" || ext == ".flac" || ext == ".mp3") {
+
           files.push_back(readMetadata(entry.path()));
           //files.push_back({entry.path().string(), entry.path().filename().string()});
         }
