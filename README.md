@@ -52,4 +52,11 @@ SHOW_HIDE_LYRICS=%
 SHOW_HIDE_ONLINE_RADIO=^
 NEXT_SONG=&
 PREVIOUS_SONG=*
+FAVOURITE=f       # (remove me) pressing f again removes the song entry
+SHOW_HIDE_FAVOURITES=F
+GOTO=:
+QUEUE=a
+SORT=s
+EXPORT_FAVOURITES=E
+QUIT=q
 ```
