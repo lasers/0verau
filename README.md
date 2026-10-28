@@ -9,7 +9,8 @@
 ![](3snap.png)
 
 # 0verau
-ncurses music player similar to cmus
+
+ncurses music player alternative to cmus
 
 # Compile
 
@@ -24,7 +25,7 @@ To start the program you must supply 2 arguments, `0verau mp3/folder 'm3u/folder
 
 # Requirements
 
-In Debian it's `sudo apt install libncurses5-dev libncursesw5-dev libsfml-dev libtag1-dev libmpg123-dev curl libcurl4-openssl-dev libvlc-dev libvlc-bin vlc`, in your other OS's search for `lib ncurses lib sfml lib tag lib mpg123 lib curl lib vlc vlc`.
+In Debian it's `sudo apt install libncurses5-dev libncursesw5-dev libsfml-dev libtag1-dev curl libcurl4-openssl-dev libvlc-dev libvlc-bin vlc`, in your other OS's search for `lib ncurses lib sfml lib tag  lib curl lib vlc vlc`.
 
 ---
 

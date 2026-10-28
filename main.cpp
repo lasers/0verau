@@ -1,20 +1,3 @@
-/*
- * Copyright 10/{27, 12}/2026 12/07/2025 https://github.com/su8/0verau
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- * MA 02110-1301, USA.
- */
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -80,6 +63,19 @@ struct List {
   std::string query;
 };
 
+// One line of the album list on the left: "All" (empty key) or an album
+struct AlbumEntry {
+  std::string key;       // the album name in lower case, albums are grouped without regard to case
+  std::string name;      // as it is shown
+  int count = 0;         // songs in it
+};
+
+struct Sidebar {
+  std::vector<AlbumEntry> items;
+  int highlight = 0;     // the selected album, the song list shows its songs
+  int offset = 0;
+};
+
 struct Action {
   const char *name;
   int key;
@@ -105,6 +101,8 @@ const Action ACTIONS[] = {
   {"SHOW_HIDE_ARTIST", '#', "Show/hide the artist"},
   {"SHOW_HIDE_LYRICS", '%', "Show/hide the lyrics"},
   {"SHOW_HIDE_ONLINE_RADIO", '^', "Switch between songs and radio stations"},
+  {"SHOW_HIDE_SIDEBAR", 'g', "Show/hide the album list on the left"},
+  {"SWITCH_FOCUS", '\t', "Switch between the album list and the songs"},
   {"FAVOURITE", 'f', "Add or remove the selected item from the favourites"},
   {"SHOW_HIDE_FAVOURITES", 'F', "Show only the favourites"},
   {"GOTO", ':', "Go to a song by its number"},
@@ -131,6 +129,13 @@ struct App {
   bool showLyrics = false;
   bool showRadio = false;
   bool showFavs = false;         // only the favourites are listed
+  // The album list on the left
+  Sidebar sidebar;
+  bool showSidebar = true;
+  bool sidebarFocus = false;     // the keys move in the album list instead of the songs
+  std::string albumFilter;       // key of the selected album, empty for all songs
+  std::vector<Track> snapshot;   // the library as the screen last saw it
+  unsigned int snapshotVersion = 0xFFFFFFFFU;
   int sortMode = 0;              // index into SORT_NAMES
   float volume = 100.f;
   // What is playing now
@@ -203,6 +208,9 @@ void scanLibrary(const std::string &root, const std::string &cacheFile, std::uno
 std::vector<Track> filterTracks(const std::vector<Track> &tracks, const std::string &term);
 void sortTracks(std::vector<Track> &tracks, int mode);
 std::vector<Track> loadStations(const std::string &dir);
+std::string albumKey(const Track &track);
+void rebuildSidebar(App &app, const std::vector<Track> &base);
+void selectAlbum(App &app);
 void rebuildSongView(App &app);
 void rebuildStationView(App &app);
 // Lyrics
@@ -229,7 +237,9 @@ void autoAdvance(App &app);
 // Screen
 std::string browserLine(const App &app, const Track &track, bool radio, int index, int numberWidth);
 void drawHeader(App &app, int rows, int cols);
-void drawBrowser(App &app, List &list, bool radio, int rows, int cols);
+int sidebarWidth(const App &app, int cols);
+void drawSidebar(App &app, int rows, int width);
+void drawBrowser(App &app, List &list, bool radio, int rows, int x, int width);
 void drawLyrics(App &app, int rows, int cols);
 void drawFooter(App &app, int rows, int cols, bool listView);
 void drawProgressBarWithTime(float elapsed, float total, int cols, int y);
@@ -237,7 +247,7 @@ void showHelp(App &app);
 std::string promptLine(int rows, const std::string &label);
 void doSearch(App &app, int rows);
 void gotoNumber(App &app, int rows);
-void handleKey(App &app, int ch, int rows);
+void handleKey(App &app, int ch, int rows, int cols);
 void runUi(App &app);
 void onSignal(int);
 
@@ -262,6 +272,7 @@ int main(int argc, char *argv[]) {
   app.keys = loadKeyBindings(homeDir() + "/0verau.conf", warnings);
   loadState(app);
   loadFavourites(app);
+  if (!app.showSidebar) { app.albumFilter.clear(); }
   if (!warnings.empty()) {
     std::string all;
     for (const auto &w : warnings) { all += (all.empty() ? "" : "; ") + w; }
@@ -355,18 +366,25 @@ void runUi(App &app) {
     drawHeader(app, rows, cols);
     bool listView = true;
     if (app.showRadio) {
-      drawBrowser(app, app.stations, true, rows, cols);
+      drawBrowser(app, app.stations, true, rows, 0, cols);
     } else if (app.showLyrics) {
       drawLyrics(app, rows, cols);
       listView = false;
     } else {
-      drawBrowser(app, app.songs, false, rows, cols);
+      // The albums on the left, the songs of the selected album next to them
+      const int sidebar = sidebarWidth(app, cols);
+      if (sidebar > 0) {
+        drawSidebar(app, rows, sidebar);
+        drawBrowser(app, app.songs, false, rows, sidebar + 1, cols - sidebar - 1);
+      } else {
+        drawBrowser(app, app.songs, false, rows, 0, cols);
+      }
     }
     drawFooter(app, rows, cols, listView);
     refresh();
     timeout((app.showLyrics && !app.showRadio) ? 50 : 100);
     int ch = getch();
-    if (ch != ERR) { handleKey(app, ch, rows); }
+    if (ch != ERR) { handleKey(app, ch, rows, cols); }
     autoAdvance(app);
     // The settings are saved a moment after they change, not at every key press
     if (app.stateDirty && std::chrono::steady_clock::now() - app.lastStateSave > std::chrono::seconds(2)) { saveState(app); }
@@ -390,6 +408,7 @@ std::string trim(const std::string &s) {
 std::string keyLabel(int key) {
   if (key == '\n') { return "Enter"; }
   if (key == ' ') { return "Space"; }
+  if (key == '\t') { return "Tab"; }
   if (key > 32 && key < 127) { return std::string(1, static_cast<char>(key)); }
   return "?";
 }
@@ -569,6 +588,8 @@ void loadState(App &app) {
       else if (key == "show_artist") { app.showArtist = (val == "1"); }
       else if (key == "favourites_only") { app.showFavs = (val == "1"); }
       else if (key == "sort") { app.sortMode = std::clamp(std::stoi(val), 0, SORT_MODES - 1); }
+      else if (key == "show_sidebar") { app.showSidebar = (val == "1"); }
+      else if (key == "album") { app.albumFilter = lower(val); }
       else if (key == "last_song") { app.lastSong = raw; }
     } catch (const std::exception &) {
       // a damaged value is ignored, the default stays
@@ -586,9 +607,13 @@ bool saveState(App &app) {
       << "show_album=" << (app.showAlbum ? 1 : 0) << "\n"
       << "show_artist=" << (app.showArtist ? 1 : 0) << "\n"
       << "favourites_only=" << (app.showFavs ? 1 : 0) << "\n"
-      << "sort=" << app.sortMode << "\n";
+      << "sort=" << app.sortMode << "\n"
+      << "show_sidebar=" << (app.showSidebar ? 1 : 0) << "\n";
   if (!app.lastSong.empty() && app.lastSong.find_first_of("\r\n") == std::string::npos) {
     out << "last_song=" << app.lastSong << "\n";
+  }
+  if (app.showSidebar && !app.albumFilter.empty() && app.albumFilter.find_first_of("\r\n") == std::string::npos) {
+    out << "album=" << app.albumFilter << "\n"; // the selected album is selected again at the next start
   }
   app.stateDirty = false;
   app.lastStateSave = std::chrono::steady_clock::now();
@@ -782,18 +807,98 @@ void sortTracks(std::vector<Track> &tracks, int mode) {
   std::stable_sort(tracks.begin(), tracks.end(), [&field](const Track &a, const Track &b) { return lower(field(a)) < lower(field(b)); });
 }
 
-// The list on the screen: the search, then only the favourites if that is on, then the sort order
+// Albums are grouped by name without regard to case; songs without an album are "Unknown Album"
+std::string albumKey(const Track &track) {
+  return lower(track.album.empty() ? std::string("Unknown Album") : track.album);
+}
+
+// The album list on the left: "All" and every album with its number of songs. base is the library
+// after the favourites filter, so the numbers are what the song list can show
+void rebuildSidebar(App &app, const std::vector<Track> &base) {
+  std::unordered_map<std::string, AlbumEntry> groups;
+  for (const auto &t : base) {
+    const std::string key = albumKey(t);
+    auto found = groups.find(key);
+    if (found == groups.end()) {
+      AlbumEntry entry;
+      entry.key = key;
+      entry.name = t.album.empty() ? std::string("Unknown Album") : t.album;
+      entry.count = 1;
+      groups[key] = entry;
+    } else {
+      found->second.count++;
+    }
+  }
+  std::vector<AlbumEntry> albums;
+  for (const auto &group : groups) { albums.push_back(group.second); }
+  std::sort(albums.begin(), albums.end(), [](const AlbumEntry &a, const AlbumEntry &b) { return a.key < b.key; });
+
+  Sidebar &sidebar = app.sidebar;
+  sidebar.items.clear();
+  AlbumEntry all;
+  all.name = "All";
+  all.count = static_cast<int>(base.size());
+  sidebar.items.push_back(all);
+  sidebar.items.insert(sidebar.items.end(), albums.begin(), albums.end());
+
+  // The selected album stays selected when the list changes
+  int selected = 0;
+  if (!app.albumFilter.empty()) {
+    selected = -1;
+    for (size_t i = 0; i < sidebar.items.size(); i++) {
+      if (sidebar.items[i].key == app.albumFilter) { selected = static_cast<int>(i); break; }
+    }
+    if (selected < 0) {
+      if (!scanDone) {
+        // The scan has not found it yet (the saved album of the last run): keep it
+        AlbumEntry waiting;
+        waiting.key = waiting.name = app.albumFilter;
+        sidebar.items.push_back(waiting);
+        selected = static_cast<int>(sidebar.items.size()) - 1;
+      } else {
+        app.albumFilter.clear(); // the album is gone
+        selected = 0;
+      }
+    }
+  }
+  sidebar.highlight = selected;
+}
+
+// The album that is highlighted in the album list becomes the selected one
+void selectAlbum(App &app) {
+  Sidebar &sidebar = app.sidebar;
+  if (sidebar.items.empty()) { return; }
+  sidebar.highlight = std::clamp(sidebar.highlight, 0, static_cast<int>(sidebar.items.size()) - 1);
+  app.albumFilter = sidebar.items[sidebar.highlight].key;
+  app.stateDirty = true;
+  rebuildSongView(app);
+  app.songs.highlight = 0;
+  app.songs.offset = 0;
+}
+
+// The list on the screen: the favourites if that is on, the selected album, the search, the sort order
 void rebuildSongView(App &app) {
-  std::vector<Track> all;
-  {
+  // The library is copied only when the scanner changed it, moving in the album list stays fast
+  const unsigned int version = libraryVersion.load();
+  if (version != app.snapshotVersion) {
     std::lock_guard<std::mutex> lock(libraryMutex);
-    all = library;
+    app.snapshot = library;
+    app.snapshotVersion = version;
   }
-  std::vector<Track> view = filterTracks(all, app.songs.query);
+  std::vector<Track> base;
   if (app.showFavs) {
-    view.erase(std::remove_if(view.begin(), view.end(), [&app](const Track &t) { return app.favSongs.count(t.path) == 0; }), view.end());
+    for (const auto &t : app.snapshot) {
+      if (app.favSongs.count(t.path)) { base.push_back(t); }
+    }
+  } else {
+    base = app.snapshot;
   }
-  sortTracks(view, app.sortMode == 0 ? 0 : app.sortMode);
+  rebuildSidebar(app, base);
+  if (!app.albumFilter.empty()) {
+    base.erase(std::remove_if(base.begin(), base.end(), [&app](const Track &t) { return albumKey(t) != app.albumFilter; }), base.end());
+  }
+  std::vector<Track> view = filterTracks(base, app.songs.query);
+  sortTracks(view, app.sortMode);
   app.songs.items = view;
 }
 
@@ -969,6 +1074,7 @@ LyricsResult loadLyrics(Track track) {
 int keyFromString(const std::string &val) {
   if (val == "ENTER") return '\n';
   if (val == "SPACE") return ' ';
+  if (val == "TAB") return '\t';
   if (val.size() == 1) return static_cast<unsigned char>(val[0]);
   return -1; // Invalid
 }
@@ -1232,13 +1338,13 @@ void drawHeader(App &app, int rows, int cols) {
   auto k = [&app](const char *name) { return keyLabel(app.keys.at(name)); };
   std::string help = k("UP") + " " + k("DOWN") + " Navigate | " + k("PLAY") + " Play | " + k("PAUSE") + " Pause | SEEK "
     + k("SEEKLEFT") + " left " + k("SEEKRIGHT") + " right | " + k("VOLUMEUP") + " " + k("VOLUMEDOWN") + " Volume UP/DOWN | "
-    + k("SEARCH") + " Search | " + k("FAVOURITE") + " Favourite | " + k("GOTO") + " Go to | " + k("QUIT") + " Quit";
+    + k("SEARCH") + " Search | " + k("FAVOURITE") + " Favourite | " + k("GOTO") + " Go to | " + k("SHOW_HIDE_SIDEBAR") + " Albums | " + k("QUIT") + " Quit";
   if (!isBound(app, '?')) { help += " | ? Help"; }
   mvaddstr(1, 0, fitWidth(help, cols).c_str()); // a longer line would wrap into the list
 }
 
 // The songs or the radio stations; the cursor line is highlighted
-void drawBrowser(App &app, List &list, bool radio, int rows, int cols) {
+void drawBrowser(App &app, List &list, bool radio, int rows, int x, int width) {
   const int visible = std::max(1, rows - 7);
   const int count = static_cast<int>(list.items.size());
   if (count == 0) {
@@ -1251,9 +1357,9 @@ void drawBrowser(App &app, List &list, bool radio, int rows, int cols) {
     } else if (radio) {
       hint = "No radio stations. Start 0verau with a folder of .m3u files as the second argument.";
     } else if (scanDone) {
-      hint = list.query.empty() ? "No songs found." : "No songs match the search.";
+      hint = (list.query.empty() && app.albumFilter.empty()) ? "No songs found." : "No songs match the album or the search.";
     }
-    mvaddstr(2, 0, fitWidth(hint, cols).c_str());
+    mvaddstr(2, x, fitWidth(hint, width).c_str());
     return;
   }
   list.highlight = std::clamp(list.highlight, 0, count - 1);
@@ -1263,14 +1369,54 @@ void drawBrowser(App &app, List &list, bool radio, int rows, int cols) {
   const int numberWidth = static_cast<int>(std::to_string(count).size());
   for (int i = 0; i < visible && list.offset + i < count; ++i) {
     const int idx = list.offset + i;
-    std::string line = fitWidth(browserLine(app, list.items[idx], radio, idx, numberWidth), cols - 1);
+    std::string line = fitWidth(browserLine(app, list.items[idx], radio, idx, numberWidth), width - 1);
     if (idx == list.highlight) {
       size_t bytes = 0;
-      line.append(static_cast<size_t>(std::max(0, cols - 1 - measure(line, INT_MAX, bytes))), ' '); // the bar spans the whole line
+      line.append(static_cast<size_t>(std::max(0, width - 1 - measure(line, INT_MAX, bytes))), ' '); // the bar spans the whole line
       attron(A_REVERSE);
     }
-    mvaddstr(i + 2, 0, line.c_str());
+    mvaddstr(i + 2, x, line.c_str());
     if (idx == list.highlight) { attroff(A_REVERSE); }
+  }
+}
+
+// Width of the album list, 0 when it is not shown: it belongs to the song list and needs a wide terminal
+int sidebarWidth(const App &app, int cols) {
+  if (!app.showSidebar || app.showRadio || app.showLyrics || cols < 60) { return 0; }
+  return std::clamp(cols / 4, 18, 32);
+}
+
+// "All" and the albums on the left. The selected album is marked with >, in focus it is a bar
+void drawSidebar(App &app, int rows, int width) {
+  Sidebar &sidebar = app.sidebar;
+  const int visible = std::max(1, rows - 7);
+  const int count = static_cast<int>(sidebar.items.size());
+  for (int y = 0; y < visible; y++) { mvaddstr(y + 2, width, "|"); }
+  if (count == 0) { return; }
+  sidebar.highlight = std::clamp(sidebar.highlight, 0, count - 1);
+  if (sidebar.highlight < sidebar.offset) { sidebar.offset = sidebar.highlight; }
+  if (sidebar.highlight >= sidebar.offset + visible) { sidebar.offset = sidebar.highlight - visible + 1; }
+  sidebar.offset = std::clamp(sidebar.offset, 0, std::max(0, count - visible));
+  for (int i = 0; i < visible && sidebar.offset + i < count; i++) {
+    const int idx = sidebar.offset + i;
+    const AlbumEntry &entry = sidebar.items[idx];
+    const bool selected = (idx == sidebar.highlight);
+    const std::string countText = std::to_string(entry.count);
+    const int room = std::max(1, width - 2 - static_cast<int>(countText.size()) - 1);
+    std::string line = std::string(selected ? "> " : "  ") + ellipsize(entry.name, room);
+    size_t bytes = 0;
+    const int used = measure(line, INT_MAX, bytes);
+    // The number of songs is on the right
+    line += std::string(static_cast<size_t>(std::max(1, width - used - static_cast<int>(countText.size()))), ' ') + countText;
+    line = fitWidth(line, width);
+    if (selected && app.sidebarFocus) {
+      line.append(static_cast<size_t>(std::max(0, width - measure(line, INT_MAX, bytes))), ' ');
+      attron(A_REVERSE);
+    } else if (selected) {
+      attron(A_BOLD);
+    }
+    mvaddstr(i + 2, 0, line.c_str());
+    attroff(A_REVERSE | A_BOLD);
   }
 }
 
@@ -1366,7 +1512,11 @@ void drawFooter(App &app, int rows, int cols, bool listView) {
         info = std::string(libraryPreloaded ? "Checking the library for changes... " : "Scanning for songs, please wait.... ")
           + "(" + std::to_string(list.items.size()) + " found)";
       } else {
-        info = "Tracks: " + std::to_string(list.items.size()) + " | Sort: " + SORT_NAMES[app.sortMode];
+        info = "Tracks: " + std::to_string(list.items.size());
+        if (!app.albumFilter.empty() && app.sidebar.highlight < static_cast<int>(app.sidebar.items.size())) {
+          info += " | Album: " + app.sidebar.items[app.sidebar.highlight].name;
+        }
+        info += std::string(" | Sort: ") + SORT_NAMES[app.sortMode];
         if (!app.queue.empty()) { info += " | Queue: " + std::to_string(app.queue.size()); }
         info += " | " + volume;
       }
@@ -1447,9 +1597,39 @@ void gotoNumber(App &app, int rows) {
   }
 }
 
-void handleKey(App &app, int ch, int rows) {
+void handleKey(App &app, int ch, int rows, int cols) {
   const std::string action = actionFor(app, ch);
   if (!action.empty()) { app.restoreCursor = false; } // the cursor stays where the user put it
+  // The album list gets the movement keys while it is in focus, and the songs follow the selected album
+  if (sidebarWidth(app, cols) > 0 && app.sidebarFocus) {
+    Sidebar &sidebar = app.sidebar;
+    const int albums = static_cast<int>(sidebar.items.size());
+    const int albumPage = std::max(1, rows - 7);
+    bool moved = true;
+    if (action == "UP") {
+      if (albums > 0) { sidebar.highlight = (sidebar.highlight - 1 + albums) % albums; }
+    } else if (action == "DOWN") {
+      if (albums > 0) { sidebar.highlight = (sidebar.highlight + 1) % albums; }
+    } else if (action == "PAGE_UP") {
+      sidebar.highlight = std::max(0, sidebar.highlight - albumPage);
+    } else if (action == "PAGE_DOWN") {
+      sidebar.highlight = std::max(0, std::min(albums - 1, sidebar.highlight + albumPage));
+    } else if (action == "HOME") {
+      sidebar.highlight = 0;
+    } else if (action == "END") {
+      sidebar.highlight = std::max(0, albums - 1);
+    } else {
+      moved = false;
+    }
+    if (moved) {
+      selectAlbum(app);
+      return;
+    }
+    if (action == "PLAY" || ch == KEY_RIGHT) { // go to the songs of the album
+      app.sidebarFocus = false;
+      return;
+    }
+  }
   List &list = app.showRadio ? app.stations : app.songs;
   const int count = static_cast<int>(list.items.size());
   const int page = std::max(1, rows - 7);
@@ -1512,6 +1692,32 @@ void handleKey(App &app, int ch, int rows) {
     rebuildStationView(app);
     app.songs.highlight = app.songs.offset = 0;
     app.stations.highlight = app.stations.offset = 0;
+  } else if (action == "SHOW_HIDE_SIDEBAR") {
+    if (app.showRadio || app.showLyrics) {
+      // The album list is not part of these views: its setting is not changed where it can't be seen
+      setMessage(app, "The album list is hidden in this view. In the song list, " + keyLabel(app.keys.at("SHOW_HIDE_SIDEBAR")) + " shows or hides it.");
+    } else {
+      app.showSidebar = !app.showSidebar;
+      app.sidebarFocus = app.showSidebar;
+      app.stateDirty = true;
+      if (!app.showSidebar) { // without the album list there is no album to choose: all songs again
+        app.albumFilter.clear();
+        rebuildSongView(app);
+        app.songs.highlight = app.songs.offset = 0;
+      }
+    }
+  } else if (action == "SWITCH_FOCUS") {
+    if (app.showRadio || app.showLyrics) {
+      setMessage(app, "The album list is hidden in this view.");
+    } else if (sidebarWidth(app, cols) > 0) {
+      app.sidebarFocus = !app.sidebarFocus;
+    } else if (!app.showSidebar) {
+      app.showSidebar = true;
+      app.sidebarFocus = true;
+      app.stateDirty = true;
+    } else {
+      setMessage(app, "The album list needs the song list and a wider terminal.");
+    }
   } else if (action == "GOTO") {
     gotoNumber(app, rows);
   } else if (action == "QUEUE") {
