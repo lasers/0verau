@@ -8,6 +8,10 @@
 
 ![](3snap.png)
 
+### Albums and album cover
+
+![](4snap.png)
+
 # 0verau
 
 ncurses music player alternative to cmus
@@ -62,3 +66,7 @@ EXPORT_FAVOURITES=E
 QUIT=q
 SHOW_HIDE_SIDEBAR=g  # to swtich between sidebar/main menu press TAB
 ```
+
+---
+
+When searchin  `/` (key pressed) for a song with the search key and type the desired name/album, to get back to the menu with songs, press `/` again followed by `enter` key (don't type anything).

@@ -40,10 +40,16 @@
 #include <unordered_map>
 #include <vector>
 #include <SFML/Audio.hpp>
+#include <SFML/Graphics/Image.hpp> // only the picture decoder: link with -lsfml-graphics
 #include <ncurses.h>
 #include <taglib/fileref.h>
 #include <taglib/tag.h>
 #include <taglib/audioproperties.h>
+#include <taglib/mpegfile.h>
+#include <taglib/id3v2tag.h>
+#include <taglib/attachedpictureframe.h>
+#include <taglib/flacfile.h>
+#include <taglib/flacpicture.h>
 #include <curl/curl.h>
 #include <vlc/vlc.h>
 #include "json.hpp"
@@ -93,6 +99,14 @@ struct Sidebar {
   int offset = 0;
 };
 
+// The cover of the playing song, already made small
+struct ArtImage {
+  int w = 0;
+  int h = 0;
+  std::vector<unsigned char> rgb;  // w * h pixels, 3 bytes each
+  std::string error;               // why there is no picture
+};
+
 struct Action {
   const char *name;
   int key;
@@ -119,6 +133,7 @@ const Action ACTIONS[] = {
   {"SHOW_HIDE_LYRICS", '%', "Show/hide the lyrics"},
   {"SHOW_HIDE_ONLINE_RADIO", '^', "Switch between songs and radio stations"},
   {"SHOW_HIDE_SIDEBAR", 'g', "Show/hide the album list on the left"},
+  {"SHOW_HIDE_ART", 'c', "Show/hide the album art"},
   {"SWITCH_FOCUS", '\t', "Switch between the album list and the songs"},
   {"FAVOURITE", 'f', "Add or remove the selected item from the favourites"},
   {"SHOW_HIDE_FAVOURITES", 'F', "Show only the favourites"},
@@ -153,6 +168,13 @@ struct App {
   std::string albumFilter;       // key of the selected album, empty for all songs
   std::vector<Track> snapshot;   // the library as the screen last saw it
   unsigned int snapshotVersion = 0xFFFFFFFFU;
+  // The album art
+  bool showArt = true;
+  bool artColour = false;        // the terminal has 256 colours: coloured cells, otherwise text characters
+  std::string artFor;            // the song the picture belongs to
+  ArtImage art;
+  std::future<ArtImage> artFuture;
+  bool artLoading = false;
   int sortMode = 0;              // index into SORT_NAMES
   float volume = 100.f;
   // What is playing now
@@ -235,6 +257,22 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
 bool fetchLyrics(const std::string &artist, const std::string &title, std::string &body);
 std::vector<LyricLine> parseLrc(const std::string &lrc);
 LyricsResult loadLyrics(Track track);
+// Album art
+std::vector<unsigned char> readFileBytes(const std::string &path, size_t maxBytes);
+std::vector<unsigned char> embeddedCover(const std::string &path);
+std::vector<unsigned char> folderCover(const std::string &songPath);
+bool imageSize(const std::vector<unsigned char> &bytes, int &w, int &h);
+void shrinkImage(const unsigned char *pixels, int channels, int w, int h, int maxSide, ArtImage &out);
+ArtImage decodeCover(const std::vector<unsigned char> &bytes);
+ArtImage loadArt(Track track);
+int xtermIndex(int r, int g, int b);
+char rampChar(int r, int g, int b);
+void fitArt(int imageW, int imageH, int maxW, int maxH, int &cellsW, int &cellsH);
+int artPanelWidth(const App &app, int cols, int reserved);
+void updateArt(App &app, bool wanted);
+int artPair(int color);
+int drawArt(App &app, int x, int y, int maxW, int maxH);
+void drawArtPanel(App &app, int rows, int x, int width);
 // Keys
 int keyFromString(const std::string &val);
 std::unordered_map<std::string, int> loadKeyBindings(const std::string &configPath, std::vector<std::string> &warnings);
@@ -257,7 +295,7 @@ void drawHeader(App &app, int rows, int cols);
 int sidebarWidth(const App &app, int cols);
 void drawSidebar(App &app, int rows, int width);
 void drawBrowser(App &app, List &list, bool radio, int rows, int x, int width);
-void drawLyrics(App &app, int rows, int cols);
+void drawLyrics(App &app, int rows, int x0, int width);
 void drawFooter(App &app, int rows, int cols, bool listView);
 void drawProgressBarWithTime(float elapsed, float total, int cols, int y);
 void showHelp(App &app);
@@ -334,6 +372,7 @@ int main(int argc, char *argv[]) {
     cbreak();
     keypad(stdscr, TRUE);
     curs_set(0);
+    app.artColour = has_colors() && COLORS >= 256 && COLOR_PAIRS >= 244; // the pairs 4..243 are used for the cover
     runUi(app);
   } catch (const std::exception &e) {
     failure = e.what();
@@ -382,19 +421,34 @@ void runUi(App &app) {
     erase();
     drawHeader(app, rows, cols);
     bool listView = true;
+    const int visibleRows = std::max(1, rows - 7);
     if (app.showRadio) {
+      updateArt(app, false);
       drawBrowser(app, app.stations, true, rows, 0, cols);
     } else if (app.showLyrics) {
-      drawLyrics(app, rows, cols);
+      // The cover on the left, the lyrics next to it
+      const int artWidth = artPanelWidth(app, cols, 0);
+      updateArt(app, artWidth > 0);
+      int lyricsX = 0;
+      if (artWidth > 0) {
+        drawArtPanel(app, rows, 0, artWidth);
+        for (int y = 0; y < visibleRows; y++) { mvaddstr(y + 2, artWidth, "|"); }
+        lyricsX = artWidth + 1;
+      }
+      drawLyrics(app, rows, lyricsX, cols - lyricsX);
       listView = false;
     } else {
-      // The albums on the left, the songs of the selected album next to them
+      // The albums on the left, the songs of the selected album next to them, the cover on the right
       const int sidebar = sidebarWidth(app, cols);
-      if (sidebar > 0) {
-        drawSidebar(app, rows, sidebar);
-        drawBrowser(app, app.songs, false, rows, sidebar + 1, cols - sidebar - 1);
-      } else {
-        drawBrowser(app, app.songs, false, rows, 0, cols);
+      const int left = sidebar > 0 ? sidebar + 1 : 0;
+      const int artWidth = artPanelWidth(app, cols, left);
+      updateArt(app, artWidth > 0);
+      const int right = artWidth > 0 ? artWidth + 1 : 0;
+      if (sidebar > 0) { drawSidebar(app, rows, sidebar); }
+      drawBrowser(app, app.songs, false, rows, left, cols - left - right);
+      if (artWidth > 0) {
+        for (int y = 0; y < visibleRows; y++) { mvaddstr(y + 2, cols - artWidth - 1, "|"); }
+        drawArtPanel(app, rows, cols - artWidth, artWidth);
       }
     }
     drawFooter(app, rows, cols, listView);
@@ -606,6 +660,7 @@ void loadState(App &app) {
       else if (key == "favourites_only") { app.showFavs = (val == "1"); }
       else if (key == "sort") { app.sortMode = std::clamp(std::stoi(val), 0, SORT_MODES - 1); }
       else if (key == "show_sidebar") { app.showSidebar = (val == "1"); }
+      else if (key == "show_art") { app.showArt = (val == "1"); }
       else if (key == "album") { app.albumFilter = lower(val); }
       else if (key == "last_song") { app.lastSong = raw; }
     } catch (const std::exception &) {
@@ -625,7 +680,8 @@ bool saveState(App &app) {
       << "show_artist=" << (app.showArtist ? 1 : 0) << "\n"
       << "favourites_only=" << (app.showFavs ? 1 : 0) << "\n"
       << "sort=" << app.sortMode << "\n"
-      << "show_sidebar=" << (app.showSidebar ? 1 : 0) << "\n";
+      << "show_sidebar=" << (app.showSidebar ? 1 : 0) << "\n"
+      << "show_art=" << (app.showArt ? 1 : 0) << "\n";
   if (!app.lastSong.empty() && app.lastSong.find_first_of("\r\n") == std::string::npos) {
     out << "last_song=" << app.lastSong << "\n";
   }
@@ -1437,10 +1493,313 @@ void drawSidebar(App &app, int rows, int width) {
   }
 }
 
-// The lyrics of the playing song, scrolled with the music
-void drawLyrics(App &app, int rows, int cols) {
+// ---- Album art ----
+// Where the picture comes from: inside the song (MP3 and FLAC), else a cover.jpg or folder.png in its folder.
+// It is decoded with SFML, made small, and drawn with coloured cells (256 colours) or text characters
+
+std::vector<unsigned char> readFileBytes(const std::string &path, size_t maxBytes) {
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) { return {}; }
+  const std::streamsize size = in.tellg();
+  if (size <= 0 || static_cast<size_t>(size) > maxBytes) { return {}; }
+  std::vector<unsigned char> bytes(static_cast<size_t>(size));
+  in.seekg(0);
+  if (!in.read(reinterpret_cast<char *>(bytes.data()), size)) { return {}; }
+  return bytes;
+}
+
+// The picture inside the song: the ID3 picture of an MP3 or the picture block of a FLAC. If the
+// song has several, the front cover is used. These calls exist in every TagLib version
+std::vector<unsigned char> embeddedCover(const std::string &path) {
+  auto toBytes = [](const TagLib::ByteVector &data) {
+    const unsigned char *begin = reinterpret_cast<const unsigned char *>(data.data());
+    return std::vector<unsigned char>(begin, begin + data.size());
+  };
+  const std::string ext = lower(std::filesystem::path(path).extension().string());
+  std::vector<unsigned char> first;
+  if (ext == ".mp3") {
+    TagLib::MPEG::File file(path.c_str());
+    if (!file.isValid() || !file.hasID3v2Tag()) { return {}; }
+    for (const auto *frame : file.ID3v2Tag()->frameList("APIC")) {
+      const auto *picture = dynamic_cast<const TagLib::ID3v2::AttachedPictureFrame *>(frame);
+      if (!picture || picture->picture().isEmpty()) { continue; }
+      if (picture->type() == TagLib::ID3v2::AttachedPictureFrame::FrontCover) { return toBytes(picture->picture()); }
+      if (first.empty()) { first = toBytes(picture->picture()); }
+    }
+  } else if (ext == ".flac") {
+    TagLib::FLAC::File file(path.c_str());
+    if (!file.isValid()) { return {}; }
+    for (const auto *picture : file.pictureList()) {
+      if (picture->data().isEmpty()) { continue; }
+      if (picture->type() == TagLib::FLAC::Picture::FrontCover) { return toBytes(picture->data()); }
+      if (first.empty()) { first = toBytes(picture->data()); }
+    }
+  }
+  return first;
+}
+
+// cover.jpg, folder.png and the like in the folder of the song; the first name of the list wins
+std::vector<unsigned char> folderCover(const std::string &songPath) {
+  namespace fs = std::filesystem;
+  static const char *const names[] = {"cover", "folder", "front", "album", "albumart", "albumartsmall", "artwork"};
+  const int count = static_cast<int>(sizeof(names) / sizeof(names[0]));
+  std::error_code ec;
+  int bestRank = count;
+  fs::path best;
+  for (fs::directory_iterator it(fs::path(songPath).parent_path(), ec), end; !ec && it != end; it.increment(ec)) {
+    std::error_code fileEc;
+    if (!it->is_regular_file(fileEc)) { continue; }
+    const std::string ext = lower(it->path().extension().string());
+    if (ext != ".jpg" && ext != ".jpeg" && ext != ".png") { continue; }
+    const std::string stem = lower(it->path().stem().string());
+    for (int rank = 0; rank < bestRank; rank++) {
+      if (stem == names[rank]) { bestRank = rank; best = it->path(); break; }
+    }
+  }
+  if (best.empty()) { return {}; }
+  return readFileBytes(best.string(), 20U * 1024U * 1024U);
+}
+
+// The size of a PNG or JPEG from its header, false for anything else. A huge picture can then be
+// refused before it is decoded and uses all the memory
+bool imageSize(const std::vector<unsigned char> &b, int &w, int &h) {
+  auto be32 = [&b](size_t at) { return (static_cast<long long>(b[at]) << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]; };
+  if (b.size() > 24 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') {
+    const long long pw = be32(16), ph = be32(20);
+    if (pw <= 0 || ph <= 0 || pw > 1000000 || ph > 1000000) { return false; }
+    w = static_cast<int>(pw);
+    h = static_cast<int>(ph);
+    return true;
+  }
+  if (b.size() > 4 && b[0] == 0xFF && b[1] == 0xD8) {
+    size_t i = 2;
+    while (i + 9 < b.size()) {
+      if (b[i] != 0xFF) { i++; continue; }
+      const unsigned char marker = b[i + 1];
+      if (marker == 0xFF) { i++; continue; }                                                    // fill byte
+      if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { i += 2; continue; } // no length
+      const size_t length = (static_cast<size_t>(b[i + 2]) << 8) | b[i + 3];
+      if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) { // start of frame
+        h = (b[i + 5] << 8) | b[i + 6];
+        w = (b[i + 7] << 8) | b[i + 8];
+        return w > 0 && h > 0;
+      }
+      i += 2 + length;
+    }
+  }
+  return false;
+}
+
+// Make the picture small (at most maxSide pixels): every new pixel is the average of the old ones it covers.
+// channels is 3 (RGB) or 4 (RGBA); a see-through pixel is mixed with black
+void shrinkImage(const unsigned char *pixels, int channels, int w, int h, int maxSide, ArtImage &out) {
+  const double scale = std::min(1.0, static_cast<double>(maxSide) / static_cast<double>(std::max(w, h)));
+  const int tw = std::max(1, static_cast<int>(w * scale));
+  const int th = std::max(1, static_cast<int>(h * scale));
+  out.w = tw;
+  out.h = th;
+  out.rgb.assign(static_cast<size_t>(tw) * static_cast<size_t>(th) * 3U, 0);
+  for (int ty = 0; ty < th; ty++) {
+    const int y0 = static_cast<int>(static_cast<long long>(ty) * h / th);
+    const int y1 = std::max(y0 + 1, static_cast<int>(static_cast<long long>(ty + 1) * h / th));
+    for (int tx = 0; tx < tw; tx++) {
+      const int x0 = static_cast<int>(static_cast<long long>(tx) * w / tw);
+      const int x1 = std::max(x0 + 1, static_cast<int>(static_cast<long long>(tx + 1) * w / tw));
+      long long sum[3] = {0, 0, 0};
+      for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+          const unsigned char *pixel = pixels + (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * static_cast<size_t>(channels);
+          const long long alpha = (channels == 4) ? pixel[3] : 255;
+          for (int c = 0; c < 3; c++) { sum[c] += pixel[c] * alpha / 255; }
+        }
+      }
+      const long long count = static_cast<long long>(y1 - y0) * (x1 - x0);
+      unsigned char *target = &out.rgb[(static_cast<size_t>(ty) * static_cast<size_t>(tw) + static_cast<size_t>(tx)) * 3U];
+      for (int c = 0; c < 3; c++) { target[c] = static_cast<unsigned char>(sum[c] / count); }
+    }
+  }
+}
+
+// Decode a PNG or JPEG into the small picture
+ArtImage decodeCover(const std::vector<unsigned char> &bytes) {
+  ArtImage image;
+  int w = 0, h = 0;
+  if (!imageSize(bytes, w, h) || static_cast<long long>(w) * h > 25000000LL) { // 25 megapixels
+    image.error = "Can't show the cover";
+    return image;
+  }
+  sf::Image decoded;
+  if (!decoded.loadFromMemory(bytes.data(), bytes.size())) {
+    image.error = "Can't show the cover";
+    return image;
+  }
+  const sf::Vector2u size = decoded.getSize();
+  if (size.x == 0 || size.y == 0) {
+    image.error = "Can't show the cover";
+    return image;
+  }
+  shrinkImage(decoded.getPixelsPtr(), 4, static_cast<int>(size.x), static_cast<int>(size.y), 128, image);
+  return image;
+}
+
+// Runs in its own thread: the picture of a song. A picture inside the song that can't be shown
+// does not stop the cover.jpg in the folder from being tried
+ArtImage loadArt(Track track) {
+  ArtImage image;
+  image.error = "No cover";
+  try {
+    for (int source = 0; source < 2; source++) {
+      const std::vector<unsigned char> bytes = (source == 0) ? embeddedCover(track.path) : folderCover(track.path);
+      if (bytes.empty()) { continue; }
+      ArtImage decoded = decodeCover(bytes);
+      if (decoded.w > 0) { return decoded; }
+      image = decoded;
+    }
+  } catch (const std::exception &) {
+    image = ArtImage();
+    image.error = "Can't show the cover";
+  }
+  return image;
+}
+
+// The nearest of the 256 terminal colours: the 6x6x6 colour cube (16..231) or the gray ramp (232..255)
+int xtermIndex(int r, int g, int b) {
+  static const int levels[6] = {0, 95, 135, 175, 215, 255};
+  auto nearestLevel = [](int value) {
+    int best = 0;
+    for (int i = 1; i < 6; i++) {
+      if (std::abs(value - levels[i]) < std::abs(value - levels[best])) { best = i; }
+    }
+    return best;
+  };
+  auto square = [](int value) { return value * value; };
+  const int ri = nearestLevel(r), gi = nearestLevel(g), bi = nearestLevel(b);
+  const int cubeDistance = square(r - levels[ri]) + square(g - levels[gi]) + square(b - levels[bi]);
+  const int grayStep = std::clamp(((r + g + b) / 3 - 8 + 5) / 10, 0, 23); // 24 grays: 8, 18 ... 238
+  const int gray = 8 + 10 * grayStep;
+  const int grayDistance = square(r - gray) + square(g - gray) + square(b - gray);
+  return grayDistance < cubeDistance ? 232 + grayStep : 16 + 36 * ri + 6 * gi + bi;
+}
+
+// For terminals without 256 colours: a darker pixel is a thinner character, a brighter one a denser one
+char rampChar(int r, int g, int b) {
+  static const char ramp[] = " .:-=+*#%@";
+  const int luminance = (299 * r + 587 * g + 114 * b) / 1000;
+  return ramp[std::clamp(luminance * 9 / 255, 0, 9)];
+}
+
+// How many cells the picture takes in a box of maxW columns and maxH rows. A cell is about twice as
+// tall as it is wide, so a square cover takes twice as many columns as rows
+void fitArt(int imageW, int imageH, int maxW, int maxH, int &cellsW, int &cellsH) {
+  const double rowsPerColumn = static_cast<double>(imageH) / static_cast<double>(imageW) / 2.0;
+  cellsW = std::max(1, maxW);
+  cellsH = std::max(1, static_cast<int>(std::lround(cellsW * rowsPerColumn)));
+  if (cellsH > maxH) {
+    cellsH = std::max(1, maxH);
+    cellsW = std::clamp(static_cast<int>(std::lround(cellsH / rowsPerColumn)), 1, std::max(1, maxW));
+  }
+}
+
+// Width of the cover panel, 0 when it is not shown. reserved: columns the album list takes on the left
+int artPanelWidth(const App &app, int cols, int reserved) {
+  if (!app.showArt || app.showRadio || cols < 90) { return 0; }
+  const int width = std::clamp(cols / 4, 20, 36);
+  return (cols - reserved - width - 1 >= 40) ? width : 0; // the rest keeps at least 40 columns
+}
+
+// Collect the finished picture, and start loading the one of the new song when the cover is on screen
+void updateArt(App &app, bool wanted) {
+  if (app.artLoading && app.artFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    app.art = app.artFuture.get();
+    app.artLoading = false;
+  }
+  if (wanted && app.source == Source::Local && !app.artLoading && app.artFor != app.now.path) {
+    app.artFor = app.now.path;
+    app.art = ArtImage();
+    app.artLoading = true;
+    app.artFuture = std::async(std::launch::async, loadArt, app.now); // the screen doesn't wait for the file
+  }
+}
+
+// A terminal colour as a background: the colours 16..255 use the pairs 4..243, 1..3 are the status colours
+int artPair(int color) {
+  static bool ready[256] = {};
+  const int pair = color - 12;
+  if (!ready[color]) {
+    init_pair(static_cast<short>(pair), COLOR_WHITE, static_cast<short>(color));
+    ready[color] = true;
+  }
+  return pair;
+}
+
+// Draw the cover, one cell for every part of it; returns the rows used
+int drawArt(App &app, int x, int y, int maxW, int maxH) {
+  if (maxW < 4 || maxH < 2) { return 0; }
+  std::string note;
   if (app.source != Source::Local) {
-    mvaddstr(2, 0, fitWidth("Lyrics are shown for the songs you play. Start a song, or switch back to the list.", cols).c_str());
+    note = "No song playing";
+  } else if (app.artLoading || app.artFor != app.now.path) {
+    note = "Loading cover...";
+  } else if (app.art.w == 0) {
+    note = app.art.error.empty() ? std::string("No cover") : app.art.error;
+  }
+  if (!note.empty()) {
+    mvaddstr(y, x, fitWidth(note, maxW).c_str());
+    return 1;
+  }
+  const ArtImage &image = app.art;
+  int cellsW = 0, cellsH = 0;
+  fitArt(image.w, image.h, maxW, maxH, cellsW, cellsH);
+  const int left = x + (maxW - cellsW) / 2;
+  for (int cy = 0; cy < cellsH; cy++) {
+    const int y0 = static_cast<int>(static_cast<long long>(cy) * image.h / cellsH);
+    const int y1 = std::max(y0 + 1, static_cast<int>(static_cast<long long>(cy + 1) * image.h / cellsH));
+    for (int cx = 0; cx < cellsW; cx++) {
+      const int x0 = static_cast<int>(static_cast<long long>(cx) * image.w / cellsW);
+      const int x1 = std::max(x0 + 1, static_cast<int>(static_cast<long long>(cx + 1) * image.w / cellsW));
+      long long sum[3] = {0, 0, 0};
+      for (int py = y0; py < y1; py++) {
+        for (int px = x0; px < x1; px++) {
+          const unsigned char *pixel = &image.rgb[(static_cast<size_t>(py) * static_cast<size_t>(image.w) + static_cast<size_t>(px)) * 3U];
+          sum[0] += pixel[0];
+          sum[1] += pixel[1];
+          sum[2] += pixel[2];
+        }
+      }
+      const long long count = static_cast<long long>(y1 - y0) * (x1 - x0);
+      const int r = static_cast<int>(sum[0] / count), g = static_cast<int>(sum[1] / count), b = static_cast<int>(sum[2] / count);
+      if (app.artColour) {
+        const int pair = artPair(xtermIndex(r, g, b));
+        attron(COLOR_PAIR(pair));
+        mvaddstr(y + cy, left + cx, " ");
+        attroff(COLOR_PAIR(pair));
+      } else {
+        const char cell[2] = {rampChar(r, g, b), '\0'};
+        mvaddstr(y + cy, left + cx, cell);
+      }
+    }
+  }
+  return cellsH;
+}
+
+// The cover with the title, artist and album of the playing song below it
+void drawArtPanel(App &app, int rows, int x, int width) {
+  const int visible = std::max(1, rows - 7);
+  const int used = drawArt(app, x, 2, width, std::max(2, std::min(visible - 4, width)));
+  if (app.source != Source::Local) { return; }
+  const std::string lines[] = {app.now.title, app.now.artist, app.now.album};
+  int row = 2 + used + 1;
+  for (int i = 0; i < 3 && row < 2 + visible; i++, row++) {
+    if (i == 0) { attron(A_BOLD); }
+    mvaddstr(row, x, ellipsize(lines[i], width).c_str());
+    if (i == 0) { attroff(A_BOLD); }
+  }
+}
+
+// The lyrics of the playing song, scrolled with the music
+void drawLyrics(App &app, int rows, int x0, int width) {
+  if (app.source != Source::Local) {
+    mvaddstr(2, x0, fitWidth("Lyrics are shown for the songs you play. Start a song, or switch back to the list.", width).c_str());
     return;
   }
   // Collect a finished download first, then start the one for the new song
@@ -1455,12 +1814,12 @@ void drawLyrics(App &app, int rows, int cols) {
     app.lyricsFuture = std::async(std::launch::async, loadLyrics, app.now); // the screen doesn't wait for the network
   }
   if (app.lyricsLoading || app.lyricsFor != app.now.path) {
-    mvaddstr(2, 0, "Loading lyrics...");
+    mvaddstr(2, x0, "Loading lyrics...");
     return;
   }
   if (!app.lyrics.error.empty()) {
     attron(COLOR_PAIR(3) | A_BOLD);
-    mvaddstr(2, 0, fitWidth(app.lyrics.error + " Switch back to the menu with the songs.", cols).c_str());
+    mvaddstr(2, x0, fitWidth(app.lyrics.error + " Switch back to the menu with the songs.", width).c_str());
     attroff(COLOR_PAIR(3) | A_BOLD);
     return;
   }
@@ -1474,7 +1833,7 @@ void drawLyrics(App &app, int rows, int cols) {
     int first = static_cast<int>(progress * static_cast<float>(total)) - rows / 4;
     first = std::clamp(first, 0, std::max(0, total - 1));
     for (int row = 0; row < rows - 5 && first + row < total; row++) {
-      mvaddstr(row + 2, 0, fitWidth(lines[first + row].text, cols).c_str());
+      mvaddstr(row + 2, x0, fitWidth(lines[first + row].text, width).c_str());
     }
     return;
   }
@@ -1494,9 +1853,9 @@ void drawLyrics(App &app, int rows, int cols) {
     if (idx < 0 || idx >= static_cast<int>(lines.size())) { continue; }
     const int y = centerY + static_cast<int>((static_cast<float>(i) - scrollOffset) * 2.f); // 2 = line spacing
     if (y < 0 || y >= rows - 3) { continue; }
-    const std::string text = fitWidth(lines[idx].text, cols);
+    const std::string text = fitWidth(lines[idx].text, width);
     size_t bytes = 0;
-    const int x = std::max(0, (cols - measure(text, INT_MAX, bytes)) / 2);
+    const int x = x0 + std::max(0, (width - measure(text, INT_MAX, bytes)) / 2); // centered in the area next to the cover
     if (i == 0) { attron(A_BOLD | A_STANDOUT); }
     mvaddstr(y, x, text.c_str());
     if (i == 0) { attroff(A_BOLD | A_STANDOUT); }
@@ -1709,6 +2068,16 @@ void handleKey(App &app, int ch, int rows, int cols) {
     rebuildStationView(app);
     app.songs.highlight = app.songs.offset = 0;
     app.stations.highlight = app.stations.offset = 0;
+  } else if (action == "SHOW_HIDE_ART") {
+    app.showArt = !app.showArt;
+    app.stateDirty = true;
+    if (app.showArt && app.showRadio) {
+      setMessage(app, "Album art is shown with the songs and the lyrics.");
+    } else if (app.showArt && cols < 90) {
+      setMessage(app, "The terminal is too narrow for the album art.");
+    } else if (app.showArt && !app.artColour) {
+      setMessage(app, "This terminal has no 256 colours: the cover is drawn with text characters.");
+    }
   } else if (action == "SHOW_HIDE_SIDEBAR") {
     if (app.showRadio || app.showLyrics) {
       // The album list is not part of these views: its setting is not changed where it can't be seen
