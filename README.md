@@ -65,6 +65,7 @@ SORT=s
 EXPORT_FAVOURITES=E
 QUIT=q
 SHOW_HIDE_SIDEBAR=g  # to swtich between sidebar/main menu press TAB
+SHOW_HIDE_ART=c
 ```
 
 ---
